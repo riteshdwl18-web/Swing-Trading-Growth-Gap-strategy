@@ -4,7 +4,7 @@
 Stock screener - reads NSE symbols from a CSV and checks Sales CAGR.
 
 Criteria:
-  Sales CAGR >= 15% over the last 2 years
+    Sales total growth >= 32.25% over the last 2 years
   e.g. if current FY is 2027, check FY24 -> FY25 -> FY26 (3 data points, 2-year window)
 """
 
@@ -32,7 +32,9 @@ INPUT_FILES = {
     "nifty-500-copy":  os.path.join(_INPUTS_DIR, "nifty-500-copy.csv"),
 }
 INPUT_FILE = INPUT_FILES["growth-gap"]   # default
-MIN_SALES_CAGR_PCT = 15.0
+# Threshold basis is now total 2-year growth (%), not annual CAGR.
+MIN_SALES_CAGR_PCT = 32.25
+MIN_TTM_VS_END_FY_PCT = 5.0
 YEARS = 2                 # 2-year CAGR window
 DELAY_BETWEEN_STOCKS = 1  # seconds between batches
 CHECKPOINT_EVERY     = 25  # save CSV progress every N stocks
@@ -62,6 +64,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Randomly sample N stocks from the input file (e.g. --sample 100)",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Bypass cached Screener data and fetch fresh values",
     )
     return parser.parse_args(argv)
 
@@ -102,12 +109,21 @@ def _has_complete_screener_annual(annual_revenue: dict[str, float]) -> bool:
     return len(annual_revenue) >= YEARS + 1 and _is_recent_fy_series(annual_revenue)
 
 
-def _fetch_screener_html(symbol_plain: str, retries: int = 3, timeout: int = 12) -> str | None:
-    """Fetch screener company page with small retries for transient network/page issues."""
+def _fetch_screener_html(
+    symbol_plain: str,
+    retries: int = 3,
+    timeout: int = 12,
+    consolidated: bool = True,
+) -> str | None:
+    """Fetch Screener company page with retries.
+
+    consolidated=True fetches /consolidated/, else standalone company page.
+    """
     import time
     import urllib.request
 
-    url = f"https://www.screener.in/company/{symbol_plain}/consolidated/"
+    suffix = "consolidated/" if consolidated else ""
+    url = f"https://www.screener.in/company/{symbol_plain}/{suffix}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
     for attempt in range(1, retries + 1):
@@ -146,24 +162,38 @@ def _parse_screener_financials(page_html: str) -> tuple[float | None, float | No
     th_values = [_clean_html_text(v) for v in th_values_raw]
     th_values = [v for v in th_values if v]
 
-    mar_years = re.findall(r"\bMar\s+(\d{4})\b", " | ".join(th_values))
-    fy_labels = [f"FY{y[2:]}" for y in mar_years]
+    # Some companies show non-Mar fiscal headers (e.g., Dec YYYY). Capture any year labels.
+    year_labels = re.findall(r"\b(20\d{2})\b", " | ".join(th_values))
+    fy_labels = [f"FY{y[2:]}" for y in year_labels]
     has_ttm_col = any(v.upper() == "TTM" for v in th_values)
 
     revenue_row_html = None
+    revenue_numbers: list[str] = []
+    fallback_row_html = None
+    fallback_numbers: list[str] = []
     for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", pl_html, re.DOTALL | re.IGNORECASE):
         first_td = re.search(r'<td[^>]*class="[^"]*text[^"]*"[^>]*>(.*?)</td>', tr, re.DOTALL | re.IGNORECASE)
         if not first_td:
             continue
         label = _clean_html_text(first_td.group(1)).lower()
         if label.startswith("revenue") or label.startswith("sales"):
-            revenue_row_html = tr
-            break
+            nums = re.findall(r"<td[^>]*>\s*([\d,]+(?:\.\d+)?)\s*</td>", tr)
+            if len(nums) >= 2:
+                revenue_row_html = tr
+                revenue_numbers = nums
+                break
+            if len(nums) > len(fallback_numbers):
+                fallback_row_html = tr
+                fallback_numbers = nums
+
+    if revenue_row_html is None and fallback_row_html is not None:
+        revenue_row_html = fallback_row_html
+        revenue_numbers = fallback_numbers
 
     if not revenue_row_html:
         return roce, ttm, annual
 
-    numbers = re.findall(r"<td[^>]*>\s*([\d,]+)\s*</td>", revenue_row_html)
+    numbers = revenue_numbers or re.findall(r"<td[^>]*>\s*([\d,]+(?:\.\d+)?)\s*</td>", revenue_row_html)
     if not numbers:
         return roce, ttm, annual
 
@@ -179,26 +209,46 @@ def _parse_screener_financials(page_html: str) -> tuple[float | None, float | No
     return roce, ttm, annual
 
 
-def get_annual_revenue(symbol: str) -> tuple[dict[str, float], str]:
+def get_annual_revenue(symbol: str, refresh: bool = False) -> tuple[dict[str, float], str]:
     """
     Returns ({fiscal_year_label: revenue_in_crores}, currency_code) sorted oldest-first.
-    Strict mode: uses Screener-derived cache only; no yfinance fallback.
+    Source mode: consolidated first; if annual data is incomplete/missing, fallback to standalone.
+    Uses Screener-derived cache only unless refresh=True; no yfinance fallback.
     """
-    # --- Use Screener-derived cache only ---
     symbol_plain = symbol.split(".")[0]
-    cache = _load_roce_cache()
-    entry = cache.get(symbol_plain)
-    if entry and entry.get("annual_revenue"):
-        from datetime import date
-        age = (date.today() - date.fromisoformat(entry["fetched_on"])).days
-        annual = entry.get("annual_revenue") or {}
-        if age <= ROCE_CACHE_DAYS and _has_complete_screener_annual(annual):
-            return dict(sorted(entry["annual_revenue"].items())), "INR"
+    if not refresh:
+        cache = _load_roce_cache()
+        entry = cache.get(symbol_plain)
+        if entry and entry.get("annual_revenue"):
+            from datetime import date
+            age = (date.today() - date.fromisoformat(entry["fetched_on"])).days
+            annual = entry.get("annual_revenue") or {}
+            if age <= ROCE_CACHE_DAYS and _has_complete_screener_annual(annual):
+                return dict(sorted(entry["annual_revenue"].items())), "INR"
 
-    raise ValueError(
-        f"Screener annual revenue unavailable/incomplete for {symbol}. "
-        f"(strict single-source mode)"
-    )
+    page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=True)
+    if not page_html:
+        # Try standalone page if consolidated page is not available.
+        page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
+        if not page_html:
+            raise ValueError(f"Screener annual revenue unavailable for {symbol}.")
+
+    _, _, annual = _parse_screener_financials(page_html)
+    if not _has_complete_screener_annual(annual):
+        # Consolidated may be sparse for some symbols; fallback to standalone.
+        page_html_standalone = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
+        if page_html_standalone:
+            _, _, annual_standalone = _parse_screener_financials(page_html_standalone)
+            if _has_complete_screener_annual(annual_standalone):
+                annual = annual_standalone
+
+    if not _has_complete_screener_annual(annual):
+        raise ValueError(
+            f"Screener annual revenue unavailable/incomplete for {symbol}. "
+            f"(strict single-source mode)"
+        )
+
+    return dict(sorted(annual.items())), "INR"
 
 
 def annual_to_quarterly_rate(annual_pct: float) -> float:
@@ -304,19 +354,20 @@ def _save_roce_cache(cache: dict) -> None:
             time.sleep(0.2)
     os.replace(tmp_path, _ROCE_CACHE_FILE)  # final attempt, let it raise if still locked
 
-def get_roce_cached(symbol_plain: str, ticker: yf.Ticker) -> tuple[float | None, float | None, dict]:
-    """Returns (roce_pct, ttm_rev_cr, annual_revenue_dict) from cache if fresh, else fetches and caches."""
+def get_roce_cached(symbol_plain: str, ticker: yf.Ticker, refresh: bool = False) -> tuple[float | None, float | None, dict]:
+    """Returns (roce_pct, ttm_rev_cr, annual_revenue_dict) from cache unless refresh=True."""
     from datetime import date
 
-    with _cache_lock:
-        cache = _load_roce_cache()
-        entry = cache.get(symbol_plain)
-        if entry:
-            age = (date.today() - date.fromisoformat(entry["fetched_on"])).days
-            annual = entry.get("annual_revenue") or {}
-            has_valid_annual = _has_complete_screener_annual(annual)
-            if age <= ROCE_CACHE_DAYS and has_valid_annual and entry.get("ttm_rev_cr") is not None:
-                return entry.get("roce_pct"), entry.get("ttm_rev_cr"), entry.get("annual_revenue") or {}
+    if not refresh:
+        with _cache_lock:
+            cache = _load_roce_cache()
+            entry = cache.get(symbol_plain)
+            if entry:
+                age = (date.today() - date.fromisoformat(entry["fetched_on"])).days
+                annual = entry.get("annual_revenue") or {}
+                has_valid_annual = _has_complete_screener_annual(annual)
+                if age <= ROCE_CACHE_DAYS and has_valid_annual and entry.get("ttm_rev_cr") is not None:
+                    return entry.get("roce_pct"), entry.get("ttm_rev_cr"), entry.get("annual_revenue") or {}
 
     # Fetch outside the lock so threads don't block each other on network I/O
     roce, ttm, annual = get_roce_and_ttm(ticker)
@@ -335,15 +386,27 @@ def get_roce_cached(symbol_plain: str, ticker: yf.Ticker) -> tuple[float | None,
 
 def get_roce_and_ttm(ticker: yf.Ticker) -> tuple[float | None, float | None, dict]:
     """
-    Fetches ROCE, TTM Sales, and annual revenue from screener.in only.
+    Fetches ROCE, TTM Sales, and annual revenue from Screener.
+    Consolidated is preferred; falls back to standalone when consolidated annual data is incomplete.
     Returns (roce_pct, ttm_rev_cr, annual_revenue_dict).
     """
     symbol_plain = ticker.ticker.split(".")[0]
-    page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12)
+    page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=True)
     if not page_html:
-        return None, None, {}
+        page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
+        if not page_html:
+            return None, None, {}
 
-    return _parse_screener_financials(page_html)
+    roce, ttm, annual = _parse_screener_financials(page_html)
+
+    if not _has_complete_screener_annual(annual):
+        page_html_standalone = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
+        if page_html_standalone:
+            s_roce, s_ttm, s_annual = _parse_screener_financials(page_html_standalone)
+            if _has_complete_screener_annual(s_annual):
+                return s_roce, s_ttm, s_annual
+
+    return roce, ttm, annual
 
 
 def get_roce(ticker: yf.Ticker) -> float | None:
@@ -450,6 +513,17 @@ def get_current_price(ticker: yf.Ticker) -> float | None:
     return float(current_price) if current_price else None
 
 
+def get_market_cap_cr(ticker: yf.Ticker) -> float | None:
+    """Returns market cap in crores from ticker.info."""
+    info = ticker.info or {}
+    market_cap = info.get("marketCap")
+    if market_cap is None or market_cap <= 0:
+        return None
+
+    CRORE = 10_000_000
+    return float(market_cap) / CRORE
+
+
 def get_price_history(symbol: str, years: int = 2) -> tuple[float | None, float | None, float | None, str | None]:
     """
     Returns (current_price, price_2years_ago, price_change_pct, date_used).
@@ -504,7 +578,8 @@ def get_price_history(symbol: str, years: int = 2) -> tuple[float | None, float 
 def check_sales_cagr(
     symbol: str,
     years: int = YEARS,
-    min_cagr: float = MIN_SALES_CAGR_PCT,
+    min_total_2y_growth: float = MIN_SALES_CAGR_PCT,
+    refresh: bool = False,
 ) -> dict:
     """
     Runs the screener for one symbol and returns a result dict.
@@ -513,8 +588,13 @@ def check_sales_cagr(
     result: dict = {
         "symbol": symbol,
         "industry_group": None,
-        "cagr_pct": None,
+        "market_cap_cr": None,
+        "total_2y_growth_pct": None,
+        "combined_growth_pct": None,
         "cagr_status": None,
+        "ttm_status": None,
+        "final_status": None,
+        "ttm_fallback_used": False,
         "base_fy": None,
         "end_fy": None,
         "base_rev_cr": None,
@@ -528,16 +608,21 @@ def check_sales_cagr(
         "error": None,
     }
 
+    target_cagr_equivalent = ((1 + min_total_2y_growth / 100) ** (1 / years) - 1) * 100 if years > 0 else None
+
     print(f"\nStock  : {symbol}")
-    print(f"Filter : Sales CAGR >= {min_cagr}% over last {years} years")
+    print(f"Filter : Total {years}Y Growth >= {min_total_2y_growth}% (equivalent CAGR >= {target_cagr_equivalent:.2f}%)")
     print("-" * 45)
 
     # Fetch screener.in data first so annual_revenue cache is warm before get_annual_revenue reads it
     ticker = yf.Ticker(symbol)
     symbol_plain = symbol.split(".")[0]
-    roce, ttm_revenue, _ = get_roce_cached(symbol_plain, ticker)
+    roce, ttm_revenue, _ = get_roce_cached(symbol_plain, ticker, refresh=refresh)
+    market_cap_cr = get_market_cap_cr(ticker)
+    result["market_cap_cr"] = round(market_cap_cr, 2) if market_cap_cr is not None else None
 
-    revenue, currency = get_annual_revenue(symbol)
+    # Avoid a second Screener fetch in refresh mode: get_roce_cached already refreshed and wrote cache.
+    revenue, currency = get_annual_revenue(symbol, refresh=False)
 
     if len(revenue) < years + 1:
         msg = (
@@ -571,26 +656,39 @@ def check_sales_cagr(
             marker = ""
         print(f"    {fy}: {rev:>10,.2f} Cr{marker}")
 
-    if ttm_revenue is not None:
-        ttm_growth = ((ttm_revenue / end_rev) - 1) * 100 if end_rev > 0 else 0
-        result["ttm_rev_cr"] = round(ttm_revenue, 2)
-        result["ttm_vs_end_fy_pct"] = round(ttm_growth, 1)
-        print(f"    TTM:  {ttm_revenue:>10,.2f} Cr  (current, ↑{ttm_growth:+.1f}% vs {end_fy})")
+    if ttm_revenue is None:
+        # Fallback for symbols where Screener doesn't expose TTM in the revenue row.
+        ttm_revenue = end_rev
+        result["ttm_fallback_used"] = True
+        print(f"    TTM:  Not available on Screener; using {end_fy} revenue as fallback")
+
+    ttm_growth = ((ttm_revenue / end_rev) - 1) * 100 if end_rev > 0 else 0
+    result["ttm_rev_cr"] = round(ttm_revenue, 2)
+    result["ttm_vs_end_fy_pct"] = round(ttm_growth, 1)
+    print(f"    TTM:  {ttm_revenue:>10,.2f} Cr  (current, ↑{ttm_growth:+.1f}% vs {end_fy})")
+    if not result["ttm_fallback_used"]:
+        result["ttm_status"] = "PASS" if ttm_growth >= MIN_TTM_VS_END_FY_PCT else "FAIL"
+        print(f"    TTM Rule (>= {MIN_TTM_VS_END_FY_PCT:.1f}%): [{result['ttm_status']}]")
 
     result["roce_pct"] = roce
 
-    cagr = compute_cagr(base_rev, end_rev, years)
-
-    if cagr is None:
-        msg = f"Could not compute CAGR (base={base_rev}, end={end_rev})"
-        print(f"\n  [ERROR] {msg}")
-        result["error"] = msg
-        return result
-
-    cagr_status = "PASS" if cagr >= min_cagr else "FAIL"
-    result["cagr_pct"] = round(cagr, 1)
+    total_2y_growth = ((end_rev / base_rev) - 1) * 100 if base_rev > 0 else None
+    combined_target = min_total_2y_growth + MIN_TTM_VS_END_FY_PCT
+    combined_growth = (total_2y_growth + ttm_growth) if total_2y_growth is not None else None
+    if result["ttm_fallback_used"]:
+        cagr_status = "PASS" if total_2y_growth is not None and total_2y_growth >= min_total_2y_growth else "FAIL"
+    else:
+        cagr_status = "PASS" if combined_growth is not None and combined_growth >= combined_target else "FAIL"
+    result["total_2y_growth_pct"] = round(total_2y_growth, 1) if total_2y_growth is not None else None
+    result["combined_growth_pct"] = round(combined_growth, 1) if combined_growth is not None else None
     result["cagr_status"] = cagr_status
-    print(f"\n  CAGR ({base_fy} -> {end_fy}, {years}Y) : {cagr:.1f}%  [{cagr_status}]")
+    print(f"\n  Growth Status ({base_fy} -> {end_fy}, {years}Y): [{cagr_status}]")
+    if total_2y_growth is not None:
+        print(f"  Total {years}Y Growth           : {total_2y_growth:.1f}%  (target >= {min_total_2y_growth:.2f}%, equivalent CAGR >= {target_cagr_equivalent:.2f}%)")
+        if result["ttm_fallback_used"]:
+            print(f"  Combined Growth (Total+TTM)     : {combined_growth:.1f}%  (info only; TTM unavailable, status uses Total {years}Y Growth target)")
+        else:
+            print(f"  Combined Growth (Total+TTM)     : {combined_growth:.1f}%  (target >= {combined_target:.2f}% = {min_total_2y_growth:.2f}% + {MIN_TTM_VS_END_FY_PCT:.2f}%)")
 
     # â”€â”€ Price Movement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     print(f"\n  Price Movement (Last {years} Years):")
@@ -602,7 +700,7 @@ def check_sales_cagr(
         if old_price is not None and price_date is not None:
             result["price_2y_ago"] = round(old_price, 2)
             result["price_2y_change_pct"] = round(price_change, 1)
-            print(f"    Price on {price_date}: â‚¹{old_price:>10,.2f}")
+            print(f"    Entry Price on {price_date}: â‚¹{old_price:>10,.2f}")
             print(f"    % Away:       {price_change:>+10.1f}%")
         else:
             print(f"    Price {years}Y ago: Not available")
@@ -616,7 +714,7 @@ def check_sales_cagr(
         print(f"  (As new quarters arrive, TTM should grow progressively)")
         print(f"  Base Year ({end_fy}): {end_rev:>10,.2f} Cr")
         print(f"  Current TTM:          {ttm_revenue:>10,.2f} Cr  (â†‘{((ttm_revenue / end_rev) - 1) * 100:+.1f}%)")
-        print(f"  Expected Annual Growth: {min_cagr}%")
+        print(f"  Expected Annualized Growth (equivalent): {target_cagr_equivalent:.2f}%")
         print()
 
     # â”€â”€ Final verdict â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -625,10 +723,14 @@ def check_sales_cagr(
     print("=" * 45)
     print(f"  Layer 1 (Historical): {cagr_status}")
 
-    if ttm_revenue is not None:
+    if not result["ttm_fallback_used"]:
         print(f"  Layer 2 (Quarterly): Available (TTM = {ttm_revenue:,.0f} Cr)")
     else:
-        print(f"  Layer 2 (Quarterly): No TTM data")
+        print(f"  Layer 2 (Quarterly): TTM missing; used {end_fy} as fallback")
+
+    final_status = cagr_status
+    result["final_status"] = final_status
+    print(f"  Final Status:         {final_status}")
 
     if roce is not None:
         print(f"  ROCE (Current):      {roce:.1f}%")
@@ -735,11 +837,11 @@ def write_results_gsheet(results: list[dict], names: dict[str, str]) -> str:
     end_rev_col  = f"End Rev {end_fy_label} (Cr)"  if end_fy_label  else "End Rev (Cr)"
 
     headers = [
-        "Name", "Symbol", "Industry Group",
+        "Name", "Symbol", "Mark.Cap", "Industry Group",
         base_rev_col, end_rev_col,
-        "2Y CAGR (%)", "CAGR Status",
-        "TTM Rev (Cr)", "TTM vs End FY (%)",
-        "Current Price (INR)", "Price 2Y Ago (INR)", "% Away",
+        "Total 2Y Growth (%)", "TTM Rev (Cr)", "TTM vs End FY (%)", "Combined Growth (%)",
+        "Final Status",
+        "Current Price (INR)", "Entry Price (INR)", "% Away",
         "ROCE (%)",
         "Error",
     ]
@@ -748,21 +850,23 @@ def write_results_gsheet(results: list[dict], names: dict[str, str]) -> str:
     for row_idx, r in enumerate(results, start=2):  # row 1 is header
         nse_sym = r["symbol"].replace(".NS", "").replace(".BO", "")
         live_price_formula = f'=GOOGLEFINANCE("NSE:{nse_sym}","price")'
-        # 2Y price change recalculated live: ((live_price - price_2y_ago) / price_2y_ago) * 100
+        # 2Y price change recalculated live: ((current_price - entry_price) / entry_price) * 100
         if r["price_2y_ago"] is not None:
-            price_change_formula = f"=(J{row_idx}-K{row_idx})/K{row_idx}*100"
+            price_change_formula = f"=(L{row_idx}-M{row_idx})/M{row_idx}*100"
         else:
             price_change_formula = ""
         rows.append([
             names.get(r["symbol"], r["symbol"]),
             r["symbol"],
+            _clean(r["market_cap_cr"]) if r.get("market_cap_cr") is not None else "",
             r.get("industry_group") or "",
             _clean(r["base_rev_cr"])       if r["base_rev_cr"]       is not None else "",
             _clean(r["end_rev_cr"])        if r["end_rev_cr"]        is not None else "",
-            _clean(r["cagr_pct"])          if r["cagr_pct"]          is not None else "",
-            r["cagr_status"]               or "",
+            _clean(r["total_2y_growth_pct"]) if r["total_2y_growth_pct"] is not None else "",
             _clean(r["ttm_rev_cr"])        if r["ttm_rev_cr"]        is not None else "",
             _clean(r["ttm_vs_end_fy_pct"]) if r["ttm_vs_end_fy_pct"] is not None else "",
+            _clean(r.get("combined_growth_pct")) if r.get("combined_growth_pct") is not None else "",
+            r["final_status"]              or "",
             live_price_formula,
             _clean(r["price_2y_ago"])      if r["price_2y_ago"]      is not None else "",
             price_change_formula,
@@ -773,23 +877,36 @@ def write_results_gsheet(results: list[dict], names: dict[str, str]) -> str:
     ws.update(rows, value_input_option="USER_ENTERED")
 
     # Basic header formatting: bold + freeze row 1
-    ws.format("A1:N1", {"textFormat": {"bold": True}})
+    ws.format("A1:P1", {"textFormat": {"bold": True}})
     ws.freeze(rows=1)
 
-    # Green highlight on % Away only when CAGR Status is PASS and % Away <= 0.
-    sh.batch_update({"requests": [{
+    # Remove old conditional-format rules on this tab, then add only the PASS rule.
+    metadata = sh.fetch_sheet_metadata()
+    sheet_meta = next((s for s in metadata.get("sheets", []) if s.get("properties", {}).get("sheetId") == ws.id), {})
+    existing_rules = sheet_meta.get("conditionalFormats", [])
+
+    requests = []
+    for idx in range(len(existing_rules) - 1, -1, -1):
+        requests.append({
+            "deleteConditionalFormatRule": {
+                "sheetId": ws.id,
+                "index": idx,
+            }
+        })
+
+    requests.append({
         "addConditionalFormatRule": {
             "rule": {
                 "ranges": [{
                     "sheetId": ws.id,
                     "startRowIndex": 1,       # skip header row
-                    "startColumnIndex": 11,   # col L (0-based), % Away shifted by new Industry Group col
-                    "endColumnIndex": 12,
+                    "startColumnIndex": 13,   # col N (0-based), % Away
+                    "endColumnIndex": 14,
                 }],
                 "booleanRule": {
                     "condition": {
                         "type": "CUSTOM_FORMULA",
-                        "values": [{"userEnteredValue": "=AND($G2=\"PASS\",$L2<=0)"}],
+                        "values": [{"userEnteredValue": "=AND($K2=\"PASS\",$N2<=0)"}],
                     },
                     "format": {
                         "backgroundColor": {"red": 0.20, "green": 0.70, "blue": 0.32},
@@ -799,7 +916,9 @@ def write_results_gsheet(results: list[dict], names: dict[str, str]) -> str:
             },
             "index": 0,
         }
-    }]})
+    })
+
+    sh.batch_update({"requests": requests})
 
     return sh.url
 def write_results_csv(results: list[dict], names: dict[str, str], output_path: str) -> None:
@@ -817,11 +936,11 @@ def write_results_csv(results: list[dict], names: dict[str, str], output_path: s
     end_rev_col = f"End Rev {end_fy_label} (Cr)" if end_fy_label else "End Rev (Cr)"
 
     fieldnames = [
-        "Name", "Symbol", "Industry Group",
+        "Name", "Symbol", "Mark.Cap", "Industry Group",
         base_rev_col, end_rev_col,
-        "2Y CAGR (%)", "CAGR Status",
-        "TTM Rev (Cr)", "TTM vs End FY (%)",
-        "Current Price (INR)", "Price 2Y Ago (INR)", "% Away",
+        "Total 2Y Growth (%)", "TTM Rev (Cr)", "TTM vs End FY (%)", "Combined Growth (%)",
+        "Final Status",
+        "Current Price (INR)", "Entry Price (INR)", "% Away",
         "ROCE (%)",
         "Error",
     ]
@@ -833,15 +952,17 @@ def write_results_csv(results: list[dict], names: dict[str, str], output_path: s
             writer.writerow({
                 "Name":                  names.get(r["symbol"], r["symbol"]),
                 "Symbol":                r["symbol"],
+                "Mark.Cap":              r["market_cap_cr"] if r.get("market_cap_cr") is not None else "",
                 "Industry Group":        r.get("industry_group") or "",
                 base_rev_col:            r["base_rev_cr"] if r["base_rev_cr"] is not None else "",
                 end_rev_col:             r["end_rev_cr"] if r["end_rev_cr"] is not None else "",
-                "2Y CAGR (%)":           r["cagr_pct"] if r["cagr_pct"] is not None else "",
-                "CAGR Status":           r["cagr_status"] or "",
+                "Total 2Y Growth (%)":   r["total_2y_growth_pct"] if r["total_2y_growth_pct"] is not None else "",
                 "TTM Rev (Cr)":          r["ttm_rev_cr"] if r["ttm_rev_cr"] is not None else "",
                 "TTM vs End FY (%)":     r["ttm_vs_end_fy_pct"] if r["ttm_vs_end_fy_pct"] is not None else "",
+                "Combined Growth (%)":   r.get("combined_growth_pct") if r.get("combined_growth_pct") is not None else "",
+                "Final Status":          r["final_status"] or "",
                 "Current Price (INR)":   r["current_price"] if r["current_price"] is not None else "",
-                "Price 2Y Ago (INR)":    r["price_2y_ago"] if r["price_2y_ago"] is not None else "",
+                "Entry Price (INR)":     r["price_2y_ago"] if r["price_2y_ago"] is not None else "",
                 "% Away":               r["price_2y_change_pct"] if r["price_2y_change_pct"] is not None else "",
                 "ROCE (%)":              r["roce_pct"] if r["roce_pct"] is not None else "",
                 "Error":                 r["error"] or "",
@@ -864,7 +985,8 @@ if __name__ == "__main__":
         print(f"Sampled {args.sample} stocks randomly (seed=42 for reproducibility)")
     total = len(symbols)
     print(f"Loaded {total} stocks from: {INPUT_FILE}")
-    print(f"Workers: {WORKERS} | Checkpoint every {CHECKPOINT_EVERY} | ROCE cache {ROCE_CACHE_DAYS} days\n")
+    print(f"Workers: {WORKERS} | Checkpoint every {CHECKPOINT_EVERY} | ROCE cache {ROCE_CACHE_DAYS} days")
+    print(f"Refresh mode: {'ON' if args.refresh else 'OFF'}\n")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(os.path.dirname(__file__), "Outputs")
@@ -880,19 +1002,30 @@ if __name__ == "__main__":
 
     def _process(item: tuple[str, str, str]) -> dict:
         name, symbol, industry = item
-        try:
-            result = check_sales_cagr(symbol)
-            result["industry_group"] = industry
-            return result
-        except Exception as e:
-            print(f"  [ERROR] {symbol}: {e}\n")
-            return {"symbol": symbol, "industry_group": industry, "error": str(e),
-                    "cagr_pct": None, "cagr_status": None,
-                    "base_fy": None, "end_fy": None,
-                    "base_rev_cr": None, "end_rev_cr": None,
-                    "ttm_rev_cr": None, "ttm_vs_end_fy_pct": None,
-                    "current_price": None, "price_2y_ago": None,
-                    "price_2y_change_pct": None, "roce_pct": None}
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                result = check_sales_cagr(symbol, refresh=args.refresh)
+                result["industry_group"] = industry
+                return result
+            except Exception as e:
+                last_err = e
+                # One retry helps with transient Screener/network failures.
+                if attempt == 0 and "unavailable" in str(e).lower():
+                    time.sleep(0.8)
+                    continue
+                break
+
+        print(f"  [ERROR] {symbol}: {last_err}\n")
+        return {"symbol": symbol, "industry_group": industry, "error": str(last_err),
+            "market_cap_cr": None,
+            "total_2y_growth_pct": None, "combined_growth_pct": None,
+                "cagr_status": None, "ttm_status": None, "final_status": None,
+                "base_fy": None, "end_fy": None,
+                "base_rev_cr": None, "end_rev_cr": None,
+                "ttm_rev_cr": None, "ttm_vs_end_fy_pct": None,
+                "current_price": None, "price_2y_ago": None,
+                "price_2y_change_pct": None, "roce_pct": None}
 
     # Split into batches of WORKERS; delay between batches, not between every stock
     batches = [symbols[i:i + WORKERS] for i in range(0, total, WORKERS)]
@@ -908,7 +1041,7 @@ if __name__ == "__main__":
                     if result.get("error"):
                         errors.append((name, symbol))
                     print(f"  [{completed}/{total}] done: {symbol}")
-                    if completed % CHECKPOINT_EVERY == 0:
+                    if OUTPUT_MODE in ("csv", "both") and completed % CHECKPOINT_EVERY == 0:
                         write_results_csv(all_results, name_map, output_file)
                         print(f"  [Checkpoint] Saved {completed}/{total} -> {output_file}")
 

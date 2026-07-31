@@ -30,6 +30,8 @@ The screener applies a 3-layer check on each stock:
 
 **PASS** = all layers on track. **FAIL** = review / exit position.
 
+For the stock screener output, `2Y CAGR (%)` remains the historical growth check, while `Final Status` is based on both `2Y CAGR (%) >= 15%` and `TTM vs End FY (%) >= 5%`.
+
 ---
 
 ## Setup
@@ -63,6 +65,16 @@ python stock_screener.py
 **Run against Nifty 500:**
 ```bash
 python stock_screener.py --input nifty-500
+```
+
+**Force a fresh Screener fetch and bypass cached values:**
+```bash
+python stock_screener.py --refresh
+```
+
+**Run against Nifty 500 v2 with Google Sheet output and refresh enabled:**
+```bash
+python stock_screener.py --input nifty-500-v2 --output gsheet --refresh
 ```
 
 **Save output to CSV (default):**
@@ -100,10 +112,12 @@ python stock_screener.py --input nifty-500 --output both
 | `CHECKPOINT_EVERY` | `25` | Save CSV progress every N stocks |
 | `ROCE_CACHE_DAYS` | `90` | Days before ROCE is re-fetched from screener.in |
 
+Use `--refresh` to bypass cached Screener data for the current run.
+
 #### ROCE cache
-ROCE is scraped from screener.in on first run and cached in `Outputs/roce_cache.json`.  
-Subsequent runs within 90 days use the cache — no screener.in requests.  
-Delete the cache file to force a fresh fetch.
+ROCE and annual revenue are scraped from the consolidated Screener page and cached in `Outputs/roce_cache.json`.  
+Subsequent runs within 90 days reuse the cache for speed.  
+Use `--refresh` to ignore the cache for a run and fetch fresh Screener values.
 
 #### Checkpoint / crash recovery
 A CSV is written every 25 stocks to `Outputs/screener_results_{timestamp}.csv`.  
@@ -203,8 +217,8 @@ Key constants at the top of each script:
 
 ## Notes
 
-- All revenue figures are in **Indian Crores (₹ Cr)**, matching [screener.in](https://www.screener.in) display.
-- **TTM** (Trailing Twelve Months) is sourced from `yfinance` live data — values may lag by a quarter.
+- All revenue figures are in **Indian Crores (₹ Cr)**, matching the consolidated [screener.in](https://www.screener.in) display.
+- **TTM** (Trailing Twelve Months) is sourced from Screener's consolidated Profit & Loss table.
 - **Entry Price** is the stock's closing price exactly 2 years ago (closest available trading day).
 - Data is fetched live from Yahoo Finance on every run; an internet connection is required.
 - On Windows, the scripts output UTF-8 characters (₹, ↑, ≥) correctly without any extra configuration.
