@@ -29,7 +29,6 @@ INPUT_FILES = {
     "growth-gap": os.path.join(_INPUTS_DIR, "growth-gap-strategy-mp.csv"),
     "nifty-500":  os.path.join(_INPUTS_DIR, "nifty-500.csv"),
     "nifty-500-v2": os.path.join(_INPUTS_DIR, "nifty-500 (2).csv"),
-    "nifty-500-copy":  os.path.join(_INPUTS_DIR, "nifty-500-copy.csv"),
 }
 INPUT_FILE = INPUT_FILES["growth-gap"]   # default
 # Threshold basis is now total 2-year growth (%), not annual CAGR.
@@ -107,6 +106,27 @@ def _is_recent_fy_series(annual_revenue: dict[str, float]) -> bool:
 def _has_complete_screener_annual(annual_revenue: dict[str, float]) -> bool:
     """Minimum annual data quality needed for strict Screener-only mode."""
     return len(annual_revenue) >= YEARS + 1 and _is_recent_fy_series(annual_revenue)
+
+
+def _max_fy_year(annual_revenue: dict[str, float]) -> int:
+    """Return max FY year as YYYY integer, or 0 if not parseable."""
+    max_year = 0
+    for label in annual_revenue.keys():
+        m = re.fullmatch(r"FY(\d{2})", str(label).strip())
+        if m:
+            max_year = max(max_year, 2000 + int(m.group(1)))
+    return max_year
+
+
+def _prefer_fresher_annual(primary: dict[str, float], fallback: dict[str, float]) -> dict[str, float]:
+    """Pick annual series with newer FY coverage; tie-break on longer length."""
+    p_year = _max_fy_year(primary)
+    f_year = _max_fy_year(fallback)
+    if f_year > p_year:
+        return fallback
+    if f_year == p_year and len(fallback) > len(primary):
+        return fallback
+    return primary
 
 
 def _fetch_screener_html(
@@ -226,21 +246,19 @@ def get_annual_revenue(symbol: str, refresh: bool = False) -> tuple[dict[str, fl
             if age <= ROCE_CACHE_DAYS and _has_complete_screener_annual(annual):
                 return dict(sorted(entry["annual_revenue"].items())), "INR"
 
-    page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=True)
-    if not page_html:
-        # Try standalone page if consolidated page is not available.
-        page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
-        if not page_html:
-            raise ValueError(f"Screener annual revenue unavailable for {symbol}.")
+    page_html_cons = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=True)
+    page_html_std = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
+    if not page_html_cons and not page_html_std:
+        raise ValueError(f"Screener annual revenue unavailable for {symbol}.")
 
-    _, _, annual = _parse_screener_financials(page_html)
-    if not _has_complete_screener_annual(annual):
-        # Consolidated may be sparse for some symbols; fallback to standalone.
-        page_html_standalone = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
-        if page_html_standalone:
-            _, _, annual_standalone = _parse_screener_financials(page_html_standalone)
-            if _has_complete_screener_annual(annual_standalone):
-                annual = annual_standalone
+    annual_cons: dict[str, float] = {}
+    annual_std: dict[str, float] = {}
+    if page_html_cons:
+        _, _, annual_cons = _parse_screener_financials(page_html_cons)
+    if page_html_std:
+        _, _, annual_std = _parse_screener_financials(page_html_std)
+
+    annual = _prefer_fresher_annual(annual_cons, annual_std)
 
     if not _has_complete_screener_annual(annual):
         raise ValueError(
@@ -391,22 +409,22 @@ def get_roce_and_ttm(ticker: yf.Ticker) -> tuple[float | None, float | None, dic
     Returns (roce_pct, ttm_rev_cr, annual_revenue_dict).
     """
     symbol_plain = ticker.ticker.split(".")[0]
-    page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=True)
-    if not page_html:
-        page_html = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
-        if not page_html:
-            return None, None, {}
+    page_html_cons = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=True)
+    page_html_std = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
+    if not page_html_cons and not page_html_std:
+        return None, None, {}
 
-    roce, ttm, annual = _parse_screener_financials(page_html)
+    c_roce, c_ttm, c_annual = (None, None, {})
+    s_roce, s_ttm, s_annual = (None, None, {})
+    if page_html_cons:
+        c_roce, c_ttm, c_annual = _parse_screener_financials(page_html_cons)
+    if page_html_std:
+        s_roce, s_ttm, s_annual = _parse_screener_financials(page_html_std)
 
-    if not _has_complete_screener_annual(annual):
-        page_html_standalone = _fetch_screener_html(symbol_plain, retries=3, timeout=12, consolidated=False)
-        if page_html_standalone:
-            s_roce, s_ttm, s_annual = _parse_screener_financials(page_html_standalone)
-            if _has_complete_screener_annual(s_annual):
-                return s_roce, s_ttm, s_annual
-
-    return roce, ttm, annual
+    chosen_annual = _prefer_fresher_annual(c_annual, s_annual)
+    if chosen_annual is s_annual:
+        return s_roce, s_ttm, s_annual
+    return c_roce, c_ttm, c_annual
 
 
 def get_roce(ticker: yf.Ticker) -> float | None:
