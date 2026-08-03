@@ -49,6 +49,57 @@ pip install -r requirements.txt
 
 ---
 
+## Google Sheets Integration (One-Time Setup)
+
+Use this setup if you want `--output gsheet` or `--output both`.
+
+### 1. Create Google Cloud project and enable APIs
+
+1. Open Google Cloud Console and create/select a project.
+2. Enable these APIs for the project:
+  - Google Sheets API
+  - Google Drive API
+
+### 2. Create OAuth Desktop credentials
+
+1. Go to **APIs & Services -> OAuth consent screen** and configure an app (External is fine for personal use).
+2. Go to **APIs & Services -> Credentials**.
+3. Click **Create Credentials -> OAuth client ID**.
+4. Choose **Desktop app**.
+5. Download the JSON file and save it in project root as:
+  - `credentials.json`
+
+### 3. Run first Google Sheets sync
+
+Run:
+
+```bash
+python stock_screener.py --output gsheet --refresh
+```
+
+On first run:
+1. A browser window opens for Google sign-in.
+2. Approve permissions for Sheets and Drive.
+3. The script stores your token locally as:
+  - `token.json`
+
+Next runs reuse `token.json` and do not prompt again unless token expires/revoked.
+
+### 4. Optional: change destination sheet/tab names
+
+In `stock_screener.py`, update:
+- `GSHEET_SPREADSHEET_NAME`
+- `GSHEET_TAB_NAME`
+
+### 5. Verify output
+
+After run completion, the console prints:
+- `Google Sheet updated: <url>`
+
+Open that URL to confirm headers, formulas, and status formatting.
+
+---
+
 ## Usage
 
 ### 1. Stock Screener (`stock_screener.py`)
@@ -74,7 +125,7 @@ python stock_screener.py --refresh
 
 **Run against Nifty 500 v2 with Google Sheet output and refresh enabled:**
 ```bash
-python stock_screener.py --input nifty-500-v2 --output gsheet --refresh
+python stock_screener.py --input nifty-500 --output gsheet --refresh
 ```
 
 **Save output to CSV (default):**

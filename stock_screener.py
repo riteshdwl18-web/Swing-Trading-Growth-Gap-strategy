@@ -35,13 +35,28 @@ INPUT_FILE = INPUT_FILES["growth-gap"]   # default
 MIN_SALES_CAGR_PCT = 32.25
 MIN_TTM_VS_END_FY_PCT = 5.0
 YEARS = 2                 # 2-year CAGR window
-DELAY_BETWEEN_STOCKS = 1  # seconds between batches
+DELAY_BETWEEN_STOCKS = 3  # seconds between batches
 CHECKPOINT_EVERY     = 25  # save CSV progress every N stocks
 ROCE_CACHE_DAYS      = 90  # reuse cached ROCE within this many days
-WORKERS              = 5   # parallel threads (increase for speed, risk more rate-limits)
+WORKERS              = 1  # parallel threads (increase for speed, risk more rate-limits)
 
 # Output mode: "csv" | "gsheet" | "both"
 OUTPUT_MODE = "csv"
+
+# Google Sheet routing
+GSHEET_PROD_ID = "1RO_8HAm2U-BlVSiAXiP1ImZEEAptpSiuwAAmgdioFuc"
+GSHEET_CONFIG = {
+    "dev": {
+        "spreadsheet_name": "growth gap strategy - dev",
+        "tab_name": "growth gap strategy dev",
+        "spreadsheet_id": None,
+    },
+    "prod": {
+        "spreadsheet_name": "growth gap strategy",
+        "tab_name": "growth gap strategy",
+        "spreadsheet_id": GSHEET_PROD_ID,
+    },
+}
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=True)
@@ -68,6 +83,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--refresh",
         action="store_true",
         help="Bypass cached Screener data and fetch fresh values",
+    )
+    parser.add_argument(
+        "--sheet-env",
+        choices=["dev", "prod"],
+        default="dev",
+        help="Google Sheet target environment when using --output gsheet/both",
+    )
+    parser.add_argument(
+        "--sheet-id",
+        default=None,
+        help="Optional Google Spreadsheet ID override",
+    )
+    parser.add_argument(
+        "--sheet-tab",
+        default=None,
+        help="Optional Google worksheet/tab name override",
+    )
+    parser.add_argument(
+        "--confirm-prod",
+        action="store_true",
+        help="Required when using --sheet-env prod with gsheet output",
     )
     return parser.parse_args(argv)
 
@@ -778,8 +814,6 @@ def load_symbols_from_csv(filepath: str) -> list[tuple[str, str, str]]:
 
 
 # ── Google Sheets config ───────────────────────────────────────────────────
-GSHEET_SPREADSHEET_NAME = "growth gap strategy"
-GSHEET_TAB_NAME         = "growth gap strategy"
 CREDENTIALS_FILE        = os.path.join(os.path.dirname(__file__), "credentials.json")
 TOKEN_FILE              = os.path.join(os.path.dirname(__file__), "token.json")
 
@@ -817,7 +851,13 @@ def _clean(val):
     return val
 
 
-def write_results_gsheet(results: list[dict], names: dict[str, str]) -> str:
+def write_results_gsheet(
+    results: list[dict],
+    names: dict[str, str],
+    sheet_env: str,
+    sheet_id_override: str | None = None,
+    sheet_tab_override: str | None = None,
+) -> str:
     """
     Writes screener results to Google Sheets.
     - Creates the spreadsheet if it does not exist.
@@ -830,20 +870,29 @@ def write_results_gsheet(results: list[dict], names: dict[str, str]) -> str:
 
     client = _get_gspread_client()
 
-    # Open or create spreadsheet
-    try:
-        sh = client.open(GSHEET_SPREADSHEET_NAME)
-        print(f"  Opened existing sheet: {GSHEET_SPREADSHEET_NAME}")
-    except SpreadsheetNotFound:
-        sh = client.create(GSHEET_SPREADSHEET_NAME)
-        print(f"  Created new sheet: {GSHEET_SPREADSHEET_NAME}")
+    env_cfg = GSHEET_CONFIG[sheet_env]
+    sheet_id = (sheet_id_override or env_cfg.get("spreadsheet_id") or "").strip() or None
+    spreadsheet_name = env_cfg["spreadsheet_name"]
+    worksheet_name = (sheet_tab_override or env_cfg["tab_name"]).strip()
+
+    # Open target spreadsheet
+    if sheet_id:
+        sh = client.open_by_key(sheet_id)
+        print(f"  Opened existing sheet by ID ({sheet_env}): {sheet_id}")
+    else:
+        try:
+            sh = client.open(spreadsheet_name)
+            print(f"  Opened existing sheet ({sheet_env}): {spreadsheet_name}")
+        except SpreadsheetNotFound:
+            sh = client.create(spreadsheet_name)
+            print(f"  Created new sheet ({sheet_env}): {spreadsheet_name}")
 
     # Open or create tab
     try:
-        ws = sh.worksheet(GSHEET_TAB_NAME)
+        ws = sh.worksheet(worksheet_name)
         ws.clear()
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=GSHEET_TAB_NAME, rows=500, cols=20)
+        ws = sh.add_worksheet(title=worksheet_name, rows=500, cols=20)
 
     # Use the most recent end_fy across all results so headers reflect the latest FY, not first processed
     base_fy_label, end_fy_label = None, None
@@ -995,6 +1044,11 @@ if __name__ == "__main__":
     OUTPUT_MODE = args.output
     INPUT_FILE = INPUT_FILES[args.input]
 
+    if OUTPUT_MODE in ("gsheet", "both") and args.sheet_env == "prod" and not args.confirm_prod:
+        print("[SAFETY] Production sheet upload blocked.")
+        print("Add --confirm-prod to continue writing to the production sheet.")
+        raise SystemExit(2)
+
     symbols = load_symbols_from_csv(INPUT_FILE)
     if args.sample and args.sample < len(symbols):
         import random
@@ -1005,6 +1059,15 @@ if __name__ == "__main__":
     print(f"Loaded {total} stocks from: {INPUT_FILE}")
     print(f"Workers: {WORKERS} | Checkpoint every {CHECKPOINT_EVERY} | ROCE cache {ROCE_CACHE_DAYS} days")
     print(f"Refresh mode: {'ON' if args.refresh else 'OFF'}\n")
+    if OUTPUT_MODE in ("gsheet", "both"):
+        env_cfg = GSHEET_CONFIG[args.sheet_env]
+        target_id = (args.sheet_id or env_cfg.get("spreadsheet_id") or "").strip() or "(none)"
+        target_tab = (args.sheet_tab or env_cfg["tab_name"]).strip()
+        target_name = env_cfg["spreadsheet_name"]
+        print(f"Google Sheet env: {args.sheet_env}")
+        print(f"  Target sheet id   : {target_id}")
+        print(f"  Target sheet name : {target_name}")
+        print(f"  Target tab        : {target_tab}\n")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(os.path.dirname(__file__), "Outputs")
@@ -1077,7 +1140,13 @@ if __name__ == "__main__":
     if OUTPUT_MODE in ("gsheet", "both"):
         try:
             print("\nUploading to Google Sheets...")
-            sheet_url = write_results_gsheet(all_results, name_map)
+            sheet_url = write_results_gsheet(
+                all_results,
+                name_map,
+                sheet_env=args.sheet_env,
+                sheet_id_override=args.sheet_id,
+                sheet_tab_override=args.sheet_tab,
+            )
             print(f"  Google Sheet updated: {sheet_url}")
         except Exception as gsheet_err:
             print(f"  [Warning] Google Sheets upload failed: {gsheet_err}")
